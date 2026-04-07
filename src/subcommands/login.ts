@@ -3,10 +3,18 @@ import { text } from "@lmstudio/lms-common";
 import { addCreateClientOptions, createClient, type CreateClientArgs } from "../createClient.js";
 import { ensureAuthenticated } from "../ensureAuthenticated.js";
 import { addLogLevelOptions, createLogger, type LogLevelArgs } from "../logLevel.js";
+import {
+  formatAuthenticationStatusMessage,
+  makeAlreadyLoggedInAsComputeDeviceError,
+  makeCannotLoginAsComputeDeviceWhileLoggedInUserError,
+  makeCannotLoginWhileComputeDeviceError,
+  normalizeAuthenticationStatus,
+} from "../authenticationStatusUtils.js";
 
 type LoginCommandOptions = OptionValues &
   CreateClientArgs &
   LogLevelArgs & {
+    asComputeDevice?: string;
     withPreAuthenticatedKeys?: boolean;
     keyId?: string;
     publicKey?: string;
@@ -21,6 +29,12 @@ const loginCommand = new Command<[], LoginCommandOptions>()
     "--status",
     text`
       Check the current authentication status without logging in.
+    `,
+  )
+  .option(
+    "--as-compute-device <token>",
+    text`
+      Log in as a compute device using a token from LM Studio.
     `,
   )
   .option(
@@ -59,6 +73,7 @@ loginCommand.action(async options => {
   const logger = createLogger(options);
   await using client = await createClient(logger, options);
   const {
+    asComputeDevice,
     status = false,
     withPreAuthenticatedKeys = false,
     keyId,
@@ -67,24 +82,56 @@ loginCommand.action(async options => {
   } = options;
 
   // Validate mutually exclusive options
-  if (status && withPreAuthenticatedKeys) {
+  if (status && (withPreAuthenticatedKeys === true || asComputeDevice !== undefined)) {
     throw new Error(text`
-      The --status and --with-pre-authenticated-keys flags cannot be used together.
+      The --status flag cannot be used with --with-pre-authenticated-keys or
+      --as-compute-device.
+    `);
+  }
+  if (withPreAuthenticatedKeys === true && asComputeDevice !== undefined) {
+    throw new Error(text`
+      The --with-pre-authenticated-keys and --as-compute-device flags cannot be used together.
     `);
   }
 
+  const authenticationStatus = normalizeAuthenticationStatus(
+    await client.repository.getAuthenticationStatus(),
+  );
+
   // Handle --status flag
   if (status) {
-    const authStatus = await client.repository.getAuthenticationStatus();
-    if (authStatus !== null) {
-      logger.info(`You are currently logged in as: ${authStatus.userName}`);
-    } else {
-      logger.info("You are not currently logged in.");
+    logger.info(formatAuthenticationStatusMessage(authenticationStatus));
+    return;
+  }
+
+  if (asComputeDevice !== undefined) {
+    switch (authenticationStatus.type) {
+      case "loggedInUser":
+        throw makeCannotLoginAsComputeDeviceWhileLoggedInUserError(authenticationStatus);
+      case "computeDevice":
+        throw makeAlreadyLoggedInAsComputeDeviceError(authenticationStatus);
+      case "none":
+        break;
+      default: {
+        const exhaustiveCheck: never = authenticationStatus;
+        throw new Error(`Unexpected authentication status: ${exhaustiveCheck}`);
+      }
     }
+
+    const computeDeviceAuthenticationStatus =
+      await client.repository.loginAsComputeDevice(asComputeDevice);
+    const ownerType =
+      computeDeviceAuthenticationStatus.ownerIsOrganization === true ? "organization" : "user";
+    logger.info(
+      `Successfully logged in as a compute device for ${ownerType} ${computeDeviceAuthenticationStatus.ownerUsername}.`,
+    );
     return;
   }
 
   if (withPreAuthenticatedKeys) {
+    if (authenticationStatus.type === "computeDevice") {
+      throw makeCannotLoginWhileComputeDeviceError(authenticationStatus);
+    }
     if (keyId === undefined || publicKey === undefined || privateKey === undefined) {
       throw new Error(text`
         You must provide --key-id, --public-key, and --private-key when using
@@ -104,10 +151,18 @@ loginCommand.action(async options => {
         --with-pre-authenticated-keys.`);
     }
   }
-  const isAuthenticated = await client.repository.isAuthenticated();
-  if (isAuthenticated) {
-    logger.info("You are already authenticated.");
-    return;
+  switch (authenticationStatus.type) {
+    case "loggedInUser":
+      logger.info(`You are already authenticated as ${authenticationStatus.userName}.`);
+      return;
+    case "computeDevice":
+      throw makeCannotLoginWhileComputeDeviceError(authenticationStatus);
+    case "none":
+      break;
+    default: {
+      const exhaustiveCheck: never = authenticationStatus;
+      throw new Error(`Unexpected authentication status: ${exhaustiveCheck}`);
+    }
   }
   await ensureAuthenticated(client, logger);
   logger.info("Authentication successful.");
